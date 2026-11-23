@@ -89,6 +89,13 @@ def get_args():
              'local camera.',
     )
     parser.add_argument(
+        '--skip',
+        type=int,
+        default=0,
+        help='Discard N frames before each processed frame (keeps up with the '
+             'stream on a slow Pi; try 1 or 2).',
+    )
+    parser.add_argument(
         '--headless',
         action='store_true',
         help='No window, no keyboard, no output.mp4. Use for unattended / systemd runs.',
@@ -237,6 +244,8 @@ def main():
         number, mode, auto, prev_number = select_mode(key, mode, auto, prev_number)
 
         # カメラキャプチャ #####################################################
+        for _ in range(max(0, args.skip)):
+            cap.grab()
         ret, image = cap.read()
         if not ret:
             # Stream hiccup / camera not up yet: reconnect instead of exiting.

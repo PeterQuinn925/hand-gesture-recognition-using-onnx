@@ -69,7 +69,7 @@ class KeyPointClassifier(object):
     def __call__(
         self,
         landmarks: np.ndarray,
-    ) -> np.ndarray:
+    ):
         """KeyPointClassifier
 
         Parameters
@@ -80,12 +80,34 @@ class KeyPointClassifier(object):
         Returns
         -------
         class_ids: np.ndarray
-            float32[N]
+            int64[N]
             ClassIDs of Hand Signatures
+        confidences: np.ndarray
+            float32[N]
+            Confidence (winning class's score) for each prediction.
+            When using the stock merged model (argmax fused into the
+            graph), raw scores aren't available, so confidence is
+            reported as 1.0 for every prediction -- thresholding has no
+            effect in that case.
         """
-        class_ids = self.onnx_session.run(
+        scores = self.onnx_session.run(
             self.output_names,
             {input_name: landmarks for input_name in self.input_names},
         )[0]
 
-        return class_ids
+        if scores.ndim == 2:
+            # Raw per-class scores (our own tf2onnx + onnxsim conversion,
+            # without the argmax-merge step) -- reduce to class indices,
+            # and take the winning score itself as the confidence. The
+            # model's final op is a Softmax, so these are already proper
+            # 0-1 probabilities -- no extra normalization needed.
+            class_ids = np.argmax(scores, axis=1)
+            confidences = np.max(scores, axis=1).astype(np.float32)
+        else:
+            # Already class indices (the stock repo's onnx, which has
+            # argmax fused into the graph via make_argmax.py + snc4onnx).
+            # No raw scores are available in this case.
+            class_ids = scores.astype(np.int64)
+            confidences = np.ones_like(class_ids, dtype=np.float32)
+
+        return class_ids, confidences

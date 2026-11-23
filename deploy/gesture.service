@@ -1,0 +1,17 @@
+[Unit]
+Description=Gesture snapshot app (reads localhost stream)
+After=vidwall-sender.service
+Wants=vidwall-sender.service
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/hand-gesture-recognition-using-onnx
+ExecStartPre=/bin/sleep 8
+ExecStart=/home/pi/hand-gesture-recognition-using-onnx/.venv/bin/python app.py --headless --stream_url "udp://127.0.0.1:1235?overrun_nonfatal=1&fifo_size=5000000"
+Restart=always
+RestartSec=5
+Environment=OPENCV_FFMPEG_LOGLEVEL=16
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

@@ -317,8 +317,8 @@ class HandLandmark(object):
                 new_coord = rotation_matrix.dot(coord_arr.T)
                 x_ls = new_coord[0]
                 y_ls = new_coord[1]
-                keypoints.append([int(x_ls), int(y_ls)])
-
+#               keypoints.append([int(x_ls), int(y_ls)])
+                keypoints.append([int(np.asarray(x_ls).item()), int(np.asarray(y_ls).item())])    
             rotated_image_width = rotated_image.shape[1]
             rotated_image_height = rotated_image.shape[0]
             roatated_hand_half_width = rotated_image_width//2
@@ -328,6 +328,7 @@ class HandLandmark(object):
             hand_landmarks[..., 0] = hand_landmarks[..., 0] + rcx - roatated_hand_half_width
             hand_landmarks[..., 1] = hand_landmarks[..., 1] + rcy - roatated_hand_half_height
             extracted_hands.append(hand_landmarks)
-            rotated_image_size_leftrights.append([rotated_image_width, rotated_image_height, float(left_hand_0_or_right_hand_1)])
+            #rotated_image_size_leftrights.append([rotated_image_width, rotated_image_height, float(left_hand_0_or_right_hand_1)])
+            rotated_image_size_leftrights.append([rotated_image_width, rotated_image_height, float(np.asarray(left_hand_0_or_right_hand_1).item())])
 
         return np.asarray(extracted_hands, dtype=np.int32), np.asarray(rotated_image_size_leftrights)

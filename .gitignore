@@ -1,6 +1,13 @@
-.vscode/
+.venv/
+train-venv/
+venv/
 __pycache__/
-*.engine
-*.profile
+*.pyc
+snapshots/
+output.mp4
 *.mp4
-test_distance_calc.py
+*.png
+*.jpg
+hagrid*/
+keypoint_hagrid_extracted.csv
+.ipynb_checkpoints/

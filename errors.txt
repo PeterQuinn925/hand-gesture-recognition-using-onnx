@@ -1,0 +1,12 @@
+output_names: ['StatefulPartitionedCall_1:0']
+scores shape: (1, 4)
+scores: [[0.07029346 0.5644546  0.08307842 0.28217357]]
+Traceback (most recent call last):
+  File "/home/pi/hand-gesture-recognition-using-onnx/app.py", line 838, in <module>
+    main()
+    ~~~~^^
+  File "/home/pi/hand-gesture-recognition-using-onnx/app.py", line 458, in main
+    hand_sign_ids, hand_sign_confidences = keypoint_classifier(
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: not enough values to unpack (expected 2, got 1)
+(app-venv) pi@vidwall:~/hand-gesture-recognition-using-onnx $ 

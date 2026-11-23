@@ -2,9 +2,14 @@
 
 import csv
 import copy
+import os
+import sys
+import time
+import signal
 import argparse
 import itertools
 from math import degrees
+from pathlib import Path
 from collections import Counter
 from collections import deque
 
@@ -17,6 +22,18 @@ from model import PalmDetection
 from model import HandLandmark
 from model import KeyPointClassifier
 from model import PointHistoryClassifier
+
+# Minimum classifier confidence (0-1) required to accept a hand-sign
+# classification at all -- both for the on-screen label and for the
+# fist-snapshot trigger below. Raise this if weak/borderline guesses are
+# triggering things they shouldn't; lower it if genuine gestures are being
+# ignored. See keypoint_classifier.py for how this score is computed.
+HAND_SIGN_CONFIDENCE_THRESHOLD = 0.85
+
+# Closed-fist snapshot trigger settings.
+HOLD_FRAMES_REQUIRED = 6      # consecutive frames the fist must be held before triggering
+COOLDOWN_SECONDS = 3.0        # ignore new triggers for this long after a snapshot
+OUTPUT_DIR = Path(__file__).resolve().parent / "snapshots"  # absolute: safe under systemd
 
 
 def get_args():
@@ -61,7 +78,27 @@ def get_args():
         help='disable image flip',
         action='store_true',
     )
-
+    parser.add_argument(
+        '-su',
+        '--stream_url',
+        type=str,
+        default='',
+        help='UDP stream URL (e.g. udp://@:1234 for broadcast, or '
+             'udp://239.0.1.23:1234 for multicast). If set, overrides '
+             '--device and reads from this network stream instead of a '
+             'local camera.',
+    )
+    parser.add_argument(
+        '--headless',
+        action='store_true',
+        help='No window, no keyboard, no output.mp4. Use for unattended / systemd runs.',
+    )
+    parser.add_argument(
+        '--output_dir',
+        type=str,
+        default='',
+        help='Where to save snapshots (default: <app dir>/snapshots).',
+    )
 
     args = parser.parse_args()
 
@@ -88,18 +125,29 @@ def main():
         [13,17],[17,18],[18,19],[19,20],[0,17],
     ]
 
-    # カメラ準備 ###############################################################
-    cap = cv.VideoCapture(cap_device)
-    cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
-    cap.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
-    cap_fps = cap.get(cv.CAP_PROP_FPS)
-    fourcc = cv.VideoWriter_fourcc('m', 'p', '4', 'v')
-    video_writer = cv.VideoWriter(
-        filename='output.mp4',
-        fourcc=fourcc,
-        fps=cap_fps,
-        frameSize=(cap_width, cap_height),
-    )
+    # Camera setup ###########################################################
+    def open_capture():
+        if args.stream_url:
+            c = cv.VideoCapture(args.stream_url, cv.CAP_FFMPEG)
+        else:
+            c = cv.VideoCapture(cap_device)
+            c.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
+            c.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
+        return c
+
+    cap = open_capture()
+    if not cap.isOpened() and not (args.headless and args.stream_url):
+        raise RuntimeError(
+            f"Could not open {args.stream_url or 'camera'}. "
+            "Is rpicam-vid/ffmpeg currently broadcasting?"
+        )
+
+    # Clean shutdown on SIGTERM (systemd stop)
+    stop_requested = {'v': False}
+    def _stop(*_):
+        stop_requested['v'] = True
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
 
     # モデルロード #############################################################
     palm_detection = PalmDetection(score_threshold=min_detection_confidence)
@@ -125,6 +173,26 @@ def main():
         point_history_classifier_labels = [
             row[0] for row in point_history_classifier_labels
         ]
+
+    # 拳(Close)・OKサイン スナップショットトリガー用セットアップ #####################
+    global OUTPUT_DIR
+    if args.output_dir:
+        OUTPUT_DIR = Path(args.output_dir).resolve()
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    close_label_id = (
+        keypoint_classifier_labels.index("Close")
+        if "Close" in keypoint_classifier_labels
+        else None
+    )
+    ok_label_id = (
+        keypoint_classifier_labels.index("OK")
+        if "OK" in keypoint_classifier_labels
+        else None
+    )
+    close_hold_count = 0
+    close_last_trigger_time = 0.0
+    ok_hold_count = 0
+    ok_last_trigger_time = 0.0
 
     # FPS計測モジュール ########################################################
     cvFpsCalc = CvFpsCalc(buffer_len=10)
@@ -155,12 +223,15 @@ def main():
     auto = False
     prev_number = -1
     image = None
+    fail_count = 0
 
     while True:
         fps = cvFpsCalc.get()
 
         # キー処理(ESC：終了) #################################################
-        key = cv.waitKey(1) if not args.image else cv.waitKey(0) if image is not None and args.image else cv.waitKey(1)
+        if stop_requested['v']:
+            break
+        key = -1 if args.headless else cv.waitKey(1)
         if key == 27:  # ESC
             break
         number, mode, auto, prev_number = select_mode(key, mode, auto, prev_number)
@@ -168,7 +239,17 @@ def main():
         # カメラキャプチャ #####################################################
         ret, image = cap.read()
         if not ret:
-            break
+            # Stream hiccup / camera not up yet: reconnect instead of exiting.
+            fail_count = fail_count + 1
+            if fail_count == 1 or fail_count % 30 == 0:
+                print(f"[warn] no frame (x{fail_count}); reopening source...", flush=True)
+            cap.release()
+            time.sleep(2.0)
+            cap = open_capture()
+            continue
+        fail_count = 0
+        cap_height, cap_width = image.shape[:2]   # use real frame size
+        wh_ratio = cap_width / cap_height
         image = image if args.disable_image_flip else cv.flip(image, 1) # ミラー表示
         debug_image = copy.deepcopy(image)
 
@@ -424,16 +505,67 @@ def main():
                 )
 
                 # ハンドサイン分類 - バッチ処理
-                hand_sign_ids = keypoint_classifier(
+                hand_sign_ids, hand_sign_confidences = keypoint_classifier(
                     np.asarray(pre_processed_landmarks, dtype=np.float32)
                 )
-                for (trackid, x1y1), landmark, hand_sign_id in zip(palm_trackid_box_x1y1s.items(), hand_landmarks, hand_sign_ids):
+                fist_seen_this_frame = False
+                ok_seen_this_frame = False
+                for (trackid, x1y1), landmark, hand_sign_id, hand_sign_confidence in zip(
+                    palm_trackid_box_x1y1s.items(), hand_landmarks, hand_sign_ids, hand_sign_confidences
+                ):
                     x1, y1 = x1y1
                     point_history.setdefault(trackid, deque(maxlen=history_length))
                     if hand_sign_id == 2:  # 指差しサイン
                         point_history[trackid].append(list(landmark[8])) # 人差指座標
                     else:
                         point_history[trackid].append([0, 0])
+                    confident = hand_sign_confidence >= HAND_SIGN_CONFIDENCE_THRESHOLD
+                    hand_sign_text = (
+                        keypoint_classifier_labels[hand_sign_id]
+                        if 0 <= hand_sign_id < len(keypoint_classifier_labels) and confident
+                        else ""
+                    )
+                    if close_label_id is not None and hand_sign_id == close_label_id and confident:
+                        fist_seen_this_frame = True
+                    if ok_label_id is not None and hand_sign_id == ok_label_id and confident:
+                        ok_seen_this_frame = True
+                    xs = landmark[:, 0]
+                    ys = landmark[:, 1]
+                    brect = [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
+                    debug_image = draw_info_text(
+                        debug_image,
+                        brect,
+                        "Hand",
+                        hand_sign_text,
+                        "",
+                    )
+
+                # 拳(Close)保持時間 + クールダウン判定 ####################
+                now = time.time()
+                close_in_cooldown = (now - close_last_trigger_time) < COOLDOWN_SECONDS
+                if fist_seen_this_frame and not close_in_cooldown:
+                    close_hold_count += 1
+                else:
+                    close_hold_count = 0
+                if close_hold_count >= HOLD_FRAMES_REQUIRED and not close_in_cooldown:
+                    filename = OUTPUT_DIR / f"snapshot_close_{int(now)}.png"
+                    cv.imwrite(str(filename), image)
+                    print(f"Closed fist detected -> saved {filename}")
+                    close_last_trigger_time = now
+                    close_hold_count = 0
+
+                # OKサイン保持時間 + クールダウン判定 #####################
+                ok_in_cooldown = (now - ok_last_trigger_time) < COOLDOWN_SECONDS
+                if ok_seen_this_frame and not ok_in_cooldown:
+                    ok_hold_count += 1
+                else:
+                    ok_hold_count = 0
+                if ok_hold_count >= HOLD_FRAMES_REQUIRED and not ok_in_cooldown:
+                    filename = OUTPUT_DIR / f"snapshot_ok_{int(now)}.png"
+                    cv.imwrite(str(filename), image)
+                    print(f"OK sign detected -> saved {filename}")
+                    ok_last_trigger_time = now
+                    ok_hold_count = 0
 
                 """
                 人差し指の軌跡が表示上に残り続けるのを割けるため
@@ -510,14 +642,13 @@ def main():
         debug_image = draw_info(debug_image, fps, mode, number, auto)
 
         # 画面反映 #############################################################
-        cv.imshow('Hand Gesture Recognition', debug_image)
-        video_writer.write(debug_image)
+        if not args.headless:
+            cv.imshow('Hand Gesture Recognition', debug_image)
 
-    if video_writer:
-        video_writer.release()
     if cap:
         cap.release()
-    cv.destroyAllWindows()
+    if not args.headless:
+        cv.destroyAllWindows()
 
 
 def select_mode(key, mode, auto=False, prev_number=-1):

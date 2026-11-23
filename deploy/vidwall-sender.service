@@ -1,0 +1,13 @@
+[Unit]
+Description=Video wall sender (rpicam-vid -> multicast + localhost)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pi
+ExecStart=/bin/bash /home/pi/hand-gesture-recognition-using-onnx/deploy/sender.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

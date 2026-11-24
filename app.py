@@ -33,6 +33,49 @@ HAND_SIGN_CONFIDENCE_THRESHOLD = 0.85
 # Closed-fist snapshot trigger settings.
 HOLD_FRAMES_REQUIRED = 6      # consecutive frames the fist must be held before triggering
 COOLDOWN_SECONDS = 3.0        # ignore new triggers for this long after a snapshot
+class LatestFrameReader:
+    """Reads the source continuously in a background thread and keeps only the
+    newest frame, so a slow main loop never builds up a backlog (lag)."""
+
+    def __init__(self, cap, open_fn):
+        import threading
+        self.cap, self.open_fn = cap, open_fn
+        self.cond = threading.Condition()
+        self.frame, self.seq, self.running = None, 0, True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        fails = 0
+        while self.running:
+            ok, frame = self.cap.read() if self.cap.isOpened() else (False, None)
+            if ok:
+                fails = 0
+                with self.cond:
+                    self.frame, self.seq = frame, self.seq + 1
+                    self.cond.notify_all()
+                continue
+            fails += 1
+            if fails == 1 or fails % 30 == 0:
+                print(f"[warn] no frame (x{fails}); reopening source...", flush=True)
+            self.cap.release()
+            time.sleep(2.0)
+            if self.running:
+                self.cap = self.open_fn()
+
+    def get(self, last_seq, timeout=2.0):
+        """Newest frame newer than last_seq, or None on timeout."""
+        with self.cond:
+            if not self.cond.wait_for(lambda: self.seq != last_seq, timeout):
+                return None
+            return self.frame, self.seq
+
+    def stop(self):
+        self.running = False
+        self.thread.join(timeout=3)
+        self.cap.release()
+
+
 OUTPUT_DIR = Path(__file__).resolve().parent / "snapshots"  # absolute: safe under systemd
 
 
@@ -92,8 +135,7 @@ def get_args():
         '--skip',
         type=int,
         default=0,
-        help='Discard N frames before each processed frame (keeps up with the '
-             'stream on a slow Pi; try 1 or 2).',
+        help='Deprecated, no effect (a background reader now always uses the newest frame).',
     )
     parser.add_argument(
         '--headless',
@@ -148,6 +190,8 @@ def main():
             f"Could not open {args.stream_url or 'camera'}. "
             "Is rpicam-vid/ffmpeg currently broadcasting?"
         )
+    reader = LatestFrameReader(cap, open_capture)
+    last_seq = 0
 
     # Clean shutdown on SIGTERM (systemd stop)
     stop_requested = {'v': False}
@@ -244,19 +288,11 @@ def main():
         number, mode, auto, prev_number = select_mode(key, mode, auto, prev_number)
 
         # カメラキャプチャ #####################################################
-        for _ in range(max(0, args.skip)):
-            cap.grab()
-        ret, image = cap.read()
-        if not ret:
-            # Stream hiccup / camera not up yet: reconnect instead of exiting.
-            fail_count = fail_count + 1
-            if fail_count == 1 or fail_count % 30 == 0:
-                print(f"[warn] no frame (x{fail_count}); reopening source...", flush=True)
-            cap.release()
-            time.sleep(2.0)
-            cap = open_capture()
-            continue
-        fail_count = 0
+        got = reader.get(last_seq, timeout=2.0)
+        if got is None:
+            continue   # no new frame yet (stream down?) - reader is reconnecting
+        image, last_seq = got
+        image = image.copy()
         cap_height, cap_width = image.shape[:2]   # use real frame size
         wh_ratio = cap_width / cap_height
         image = image if args.disable_image_flip else cv.flip(image, 1) # ミラー表示
@@ -655,7 +691,7 @@ def main():
             cv.imshow('Hand Gesture Recognition', debug_image)
 
     if cap:
-        cap.release()
+        reader.stop()
     if not args.headless:
         cv.destroyAllWindows()
 
